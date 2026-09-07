@@ -1,0 +1,50 @@
+name: Compilar Executavel Windows (Release)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build TarjadorPDF.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout do Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Instalar Dependencias e PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compilar Executavel com PyInstaller
+        run: |
+          pyinstaller --noconsole --onefile --name "TarjadorPDF" --icon "app_icon.ico" --collect-all tkinterdnd2 --clean tarjar_pdf.py
+
+      - name: Salvar Artefato do Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TarjadorPDF-Windows
+          path: dist/TarjadorPDF.exe
+          if-no-files-found: error
+
+      - name: Publicar Release no GitHub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TarjadorPDF.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
