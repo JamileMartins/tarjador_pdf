@@ -6,10 +6,15 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     name: Build TarjadorPDF.exe
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout do Repositorio
