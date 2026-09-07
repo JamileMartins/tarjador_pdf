@@ -13,18 +13,25 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import json
 import queue
 import threading
+import unicodedata
 import pymupdf
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-VERSAO_APP = "1.2.0"
+VERSAO_APP = "1.3.0"
 
 # Não há dados pessoais fixados no código-fonte; tudo é lido e salvo no arquivo JSON.
 TERMOS_SENSIVEIS_PADRAO: list[str] = []
+
+# Expressões regulares para detecção de dados padronizados
+PADRAO_CPF = re.compile(r'\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b')
+PADRAO_EMAIL = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+PADRAO_TELEFONE = re.compile(r'(?:\(?\d{2}\)?\s*)?(?:9\s*)?\d{4,5}[-\s]?\d{4}\b')
 
 
 def _safe_print(msg: str):
@@ -34,6 +41,32 @@ def _safe_print(msg: str):
         print(msg)
     except UnicodeEncodeError:
         print(msg.encode(enc, errors="replace").decode(enc))
+
+
+def criar_regex_tolerante(termo: str) -> re.Pattern:
+    """Cria uma expressão regular que ignora acentos, maiúsculas/minúsculas e variações de espaçamento."""
+    mapa_acentos = {
+        'a': '[aáàâãäAÁÀÂÃÄ]',
+        'e': '[eéèêëEÉÈÊË]',
+        'i': '[iíìîïIÍÌÎÏ]',
+        'o': '[oóòôõöOÓÒÔÕÖ]',
+        'u': '[uúùûüUÚÙÛÜ]',
+        'c': '[cçCÇ]',
+    }
+    # Normaliza primeiro retirando diacríticos
+    termo_sem_acento = "".join(
+        c for c in unicodedata.normalize("NFD", termo) if unicodedata.category(c) != "Mn"
+    )
+    padrao = ""
+    for char in termo_sem_acento:
+        cl = mapa_acentos.get(char.lower())
+        if cl:
+            padrao += cl
+        elif char.isspace():
+            padrao += r"\s+"
+        else:
+            padrao += re.escape(char)
+    return re.compile(padrao, re.IGNORECASE)
 
 
 def obter_caminho_config() -> str:
@@ -93,7 +126,16 @@ def salvar_termos_config(termos: list[str]) -> bool:
         return False
 
 
-def tarjar(caminho_entrada: str, termos: list[str], callback_log=None) -> str:
+def tarjar(
+    caminho_entrada: str,
+    termos: list[str],
+    ignorar_acentos: bool = True,
+    tarjar_cpfs: bool = False,
+    tarjar_emails: bool = False,
+    tarjar_telefones: bool = False,
+    cor_tarja: str = "preto",
+    callback_log=None
+) -> str:
     """Tarja os termos sensíveis no arquivo PDF informado e salva com sufixo '_tarjado.pdf'."""
     def log(msg: str):
         if callback_log:
@@ -104,33 +146,83 @@ def tarjar(caminho_entrada: str, termos: list[str], callback_log=None) -> str:
     if not os.path.isfile(caminho_entrada):
         raise FileNotFoundError(f"Arquivo não encontrado: {caminho_entrada}")
 
+    cor_fill = (0, 0, 0) if cor_tarja.lower() != "branco" else (1, 1, 1)
     nome_arquivo = os.path.basename(caminho_entrada)
     caminho_saida = caminho_entrada.rsplit(".", 1)[0] + "_tarjado.pdf"
 
-    log(f"--- Iniciando: {nome_arquivo} ---")
+    log(f"--- Iniciando: {nome_arquivo} (Tarja: {cor_tarja.capitalize()}) ---")
     doc = pymupdf.open(caminho_entrada)
+
     contagem = {termo: 0 for termo in termos}
+    contagem_padroes = {"CPFs": 0, "E-mails": 0, "Telefones": 0}
 
     total_paginas = len(doc)
     for num_pag, pagina in enumerate(doc, 1):
+        texto_pagina = pagina.get_text("text")
+
+        # 1. Padrões Regex Automáticos
+        if tarjar_cpfs:
+            matches_cpf = set(PADRAO_CPF.findall(texto_pagina))
+            for cpf in matches_cpf:
+                for area in pagina.search_for(cpf):
+                    pagina.add_redact_annot(area, fill=cor_fill)
+                    contagem_padroes["CPFs"] += 1
+
+        if tarjar_emails:
+            matches_email = set(PADRAO_EMAIL.findall(texto_pagina))
+            for em in matches_email:
+                for area in pagina.search_for(em):
+                    pagina.add_redact_annot(area, fill=cor_fill)
+                    contagem_padroes["E-mails"] += 1
+
+        if tarjar_telefones:
+            matches_tel = set(PADRAO_TELEFONE.findall(texto_pagina))
+            for tel in matches_tel:
+                for area in pagina.search_for(tel):
+                    pagina.add_redact_annot(area, fill=cor_fill)
+                    contagem_padroes["Telefones"] += 1
+
+        # 2. Termos Específicos
         for termo in termos:
-            areas = pagina.search_for(termo)
-            for area in areas:
-                pagina.add_redact_annot(area, fill=(0, 0, 0))  # preenche de preto sólido
+            areas_encontradas = []
+            if ignorar_acentos:
+                try:
+                    rgx = criar_regex_tolerante(termo)
+                    correspondencias = set(rgx.findall(texto_pagina))
+                    for m in correspondencias:
+                        areas_encontradas.extend(pagina.search_for(m))
+                except Exception:
+                    pass
+
+            # Busca direta (exata ou fallback)
+            for a in pagina.search_for(termo):
+                if a not in areas_encontradas:
+                    areas_encontradas.append(a)
+
+            for area in areas_encontradas:
+                pagina.add_redact_annot(area, fill=cor_fill)
                 contagem[termo] += 1
+
         pagina.apply_redactions()  # remove o texto/objeto do PDF permanentemente
 
     doc.save(caminho_saida)
     doc.close()
 
     log(f"[OK] Salvo como: {os.path.basename(caminho_saida)} ({total_paginas} página(s))")
-    total_encontrados = sum(contagem.values())
+
+    total_encontrados = sum(contagem.values()) + sum(contagem_padroes.values())
     log(f"Ocorrências tarjadas (Total: {total_encontrados}):")
+
     for termo, n in contagem.items():
         if n > 0:
             log(f"  [OK] {n:>2}x: {termo}")
         else:
             log(f"  [--]  0x: {termo} (não encontrado)")
+
+    for padrao, n in contagem_padroes.items():
+        if n > 0:
+            log(f"  [AUTO] {n:>2}x: {padrao} detectados automaticamente")
+
     log("")
 
     return caminho_saida
@@ -144,8 +236,8 @@ class TarjadorPDFApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Tarjador de PDFs v{VERSAO_APP} - Remoção de Dados Sensíveis")
-        self.geometry("860x730")
-        self.minsize(720, 580)
+        self.geometry("880x790")
+        self.minsize(740, 640)
 
         # Configuração de estilo ttk
         self.style = ttk.Style(self)
@@ -159,6 +251,13 @@ class TarjadorPDFApp(tk.Tk):
         self.caminho_config = obter_caminho_config()
         self.ultima_pasta_usada = os.path.dirname(os.path.abspath(__file__))
         self.fila_mensagens: queue.Queue = queue.Queue()
+
+        # Variáveis de opções avançadas
+        self.var_ignorar_acentos = tk.BooleanVar(value=True)
+        self.var_tarjar_cpfs = tk.BooleanVar(value=False)
+        self.var_tarjar_emails = tk.BooleanVar(value=False)
+        self.var_tarjar_telefones = tk.BooleanVar(value=False)
+        self.var_cor_tarja = tk.StringVar(value="preto")
 
         self._construir_interface()
         self._agendar_leitura_fila()
@@ -198,7 +297,7 @@ class TarjadorPDFApp(tk.Tk):
 
         lbl_subtitulo = ttk.Label(
             frame_header_esq,
-            text="Selecione um ou mais arquivos PDF para tarjar e remover definitivamente textos sensíveis.",
+            text="Selecione arquivos PDF para tarjar e remover definitivamente dados sensíveis.",
             font=("Segoe UI", 9)
         )
         lbl_subtitulo.pack(anchor=tk.W, pady=(2, 0))
@@ -255,7 +354,7 @@ class TarjadorPDFApp(tk.Tk):
             selectmode=tk.EXTENDED,
             yscrollcommand=scrollbar_y.set,
             font=("Consolas", 9),
-            height=6
+            height=5
         )
         scrollbar_y.config(command=self.listbox_arquivos.yview)
 
@@ -283,7 +382,7 @@ class TarjadorPDFApp(tk.Tk):
 
         lbl_dica_termos = ttk.Label(
             frame_termos_topo,
-            text="Digite ou edite os termos abaixo (um por linha):",
+            text="Digite ou edite os termos específicos abaixo (um por linha):",
             font=("Segoe UI", 8)
         )
         lbl_dica_termos.pack(side=tk.LEFT)
@@ -311,13 +410,72 @@ class TarjadorPDFApp(tk.Tk):
 
         self.txt_termos = ScrolledText(
             frame_termos,
-            height=6,
+            height=5,
             font=("Consolas", 9),
             wrap=tk.WORD
         )
         self.txt_termos.pack(fill=tk.BOTH, expand=True)
 
-        # Seção 3: Ação e Progresso
+        # Seção 3: Opções Avançadas do Motor de Tarjação
+        frame_opcoes = ttk.LabelFrame(container, text=" 3. Opções Avançadas de Tarjação ", padding=10)
+        frame_opcoes.pack(fill=tk.X, pady=(0, 8))
+
+        # Linha 1: Busca inteligente e detecção automática
+        frame_chk = ttk.Frame(frame_opcoes)
+        frame_chk.pack(fill=tk.X)
+
+        chk_acentos = ttk.Checkbutton(
+            frame_chk,
+            text="Busca Inteligente (ignorar acentos e maiúsculas/minúsculas)",
+            variable=self.var_ignorar_acentos
+        )
+        chk_acentos.pack(side=tk.LEFT, padx=(0, 14))
+
+        chk_cpfs = ttk.Checkbutton(
+            frame_chk,
+            text="Auto-tarjar todos os CPFs",
+            variable=self.var_tarjar_cpfs
+        )
+        chk_cpfs.pack(side=tk.LEFT, padx=(0, 14))
+
+        chk_emails = ttk.Checkbutton(
+            frame_chk,
+            text="Auto-tarjar todos os E-mails",
+            variable=self.var_tarjar_emails
+        )
+        chk_emails.pack(side=tk.LEFT, padx=(0, 14))
+
+        chk_telefones = ttk.Checkbutton(
+            frame_chk,
+            text="Auto-tarjar Telefones",
+            variable=self.var_tarjar_telefones
+        )
+        chk_telefones.pack(side=tk.LEFT)
+
+        # Linha 2: Cor da Tarja
+        frame_cor = ttk.Frame(frame_opcoes)
+        frame_cor.pack(fill=tk.X, pady=(6, 0))
+
+        lbl_cor = ttk.Label(frame_cor, text="Cor da Tarja:", font=("Segoe UI", 9, "bold"))
+        lbl_cor.pack(side=tk.LEFT, padx=(0, 8))
+
+        rb_preto = ttk.Radiobutton(
+            frame_cor,
+            text="Preto Sólido (Padrão)",
+            variable=self.var_cor_tarja,
+            value="preto"
+        )
+        rb_preto.pack(side=tk.LEFT, padx=(0, 12))
+
+        rb_branco = ttk.Radiobutton(
+            frame_cor,
+            text="Branco (Ocultação Limpa / Impressão)",
+            variable=self.var_cor_tarja,
+            value="branco"
+        )
+        rb_branco.pack(side=tk.LEFT)
+
+        # Seção 4: Ação e Progresso
         frame_acao = ttk.Frame(container)
         frame_acao.pack(fill=tk.X, pady=(0, 8))
 
@@ -351,13 +509,13 @@ class TarjadorPDFApp(tk.Tk):
         self.lbl_status = ttk.Label(frame_acao, text="Pronto para iniciar", font=("Segoe UI", 9))
         self.lbl_status.pack(side=tk.RIGHT)
 
-        # Seção 4: Log de Execução
-        frame_log = ttk.LabelFrame(container, text=" 3. Registro de Execução (Log) ", padding=10)
+        # Seção 5: Log de Execução
+        frame_log = ttk.LabelFrame(container, text=" 4. Registro de Execução (Log) ", padding=10)
         frame_log.pack(fill=tk.BOTH, expand=True)
 
         self.txt_log = ScrolledText(
             frame_log,
-            height=8,
+            height=7,
             font=("Consolas", 9),
             state=tk.NORMAL,
             bg="#f8fafc",
@@ -369,15 +527,15 @@ class TarjadorPDFApp(tk.Tk):
         """Abre a janela com a seção Sobre, descrição e instruções detalhadas."""
         janela = tk.Toplevel(self)
         janela.title("Sobre o Tarjador de PDFs")
-        janela.geometry("640x540")
+        janela.geometry("660x560")
         janela.minsize(580, 480)
         janela.transient(self)
         janela.grab_set()
 
         # Centraliza a janela sobre a principal
         self.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() // 2) - (640 // 2)
-        y = self.winfo_y() + (self.winfo_height() // 2) - (540 // 2)
+        x = self.winfo_x() + (self.winfo_width() // 2) - (660 // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (560 // 2)
         janela.geometry(f"+{max(10, x)}+{max(10, y)}")
 
         pad = ttk.Frame(janela, padding=16)
@@ -411,22 +569,32 @@ Muitos editores apenas desenham retângulos pretos sobre o texto. Nesses casos, 
 Este programa utiliza PyMuPDF para expurgar de verdade os caracteres do código interno do documento, tornando impossível recuperar a informação censurada.
 
 --------------------------------------------------
+NOVIDADES DA VERSÃO 1.3.0:
+• Busca Inteligente: Tolera variações de acentuação ('á' = 'a') e maiúsculas/minúsculas.
+• Auto-Detecção por Padrões (Regex): Tarja automaticamente CPFs, E-mails e Telefones detectados no documento.
+• Cor da Tarja Customizável: Escolha entre Preto Sólido ou Branco (ocultação limpa para impressões).
+
+--------------------------------------------------
 GUIA RÁPIDO PARA NOVOS UTILIZADORES:
 
 1. DEFINIR TERMOS SENSÍVEIS (Quadro 2)
-   - Digite ou cole os dados que deseja ocultar (um por linha).
+   - Digite ou cole os dados específicos que deseja ocultar (um por linha).
    - Clique em 'Salvar no JSON'. Os termos ficam salvos no arquivo 'termos_sensiveis.json' ao lado do programa e nunca são perdidos.
 
 2. SELECIONAR OS DOCUMENTOS (Quadro 1)
    - Clique em 'Selecionar Arquivo(s)...' para escolher um ou mais PDFs de qualquer pasta.
    - Ou clique em 'Adicionar Pasta...' para carregar todos os PDFs de um diretório de uma só vez.
 
-3. INICIAR A TARJAÇÃO
+3. CONFIGURAR OPÇÕES AVANÇADAS (Quadro 3)
+   - Ative a busca inteligente e/ou detecção automática de CPFs/E-mails.
+   - Escolha a cor da tarja desejada.
+
+4. INICIAR A TARJAÇÃO
    - Clique no botão verde 'Iniciar Tarjação dos PDFs'.
    - O processamento roda em segundo plano e a barra indicará o progresso.
    - O registro (Log) detalhará quantas vezes cada termo foi encontrado e removido.
 
-4. ACESSAR OS RESULTADOS
+5. ACESSAR OS RESULTADOS
    - Para sua total segurança, os arquivos originais NUNCA são sobrescritos.
    - Cada arquivo gera uma nova cópia com o sufixo '_tarjado.pdf' (ex.: fatura_tarjado.pdf) na mesma pasta original.
    - Ao concluir, clique em 'Abrir Pasta dos Arquivos' para visualizá-los diretamente no Windows Explorer.
@@ -577,15 +745,31 @@ PRIVACIDADE & PORTABILIDADE:
             return
 
         termos = self._obter_termos()
-        if not termos:
+        tarjar_qualquer_padrao = (
+            self.var_tarjar_cpfs.get() or
+            self.var_tarjar_emails.get() or
+            self.var_tarjar_telefones.get()
+        )
+
+        if not termos and not tarjar_qualquer_padrao:
             messagebox.showwarning(
-                "Nenhum termo",
-                "Por favor, informe ao menos um termo sensível a tarjar na caixa de texto."
+                "Nenhum termo ou padrão",
+                "Por favor, informe ao menos um termo sensível a tarjar ou ative uma das opções de auto-tarjação (CPFs, E-mails ou Telefones)."
             )
             return
 
-        # Salva os termos automaticamente ao iniciar para nunca perder edições
-        salvar_termos_config(termos)
+        # Salva os termos automaticamente se houver termos digitados
+        if termos:
+            salvar_termos_config(termos)
+
+        # Captura opções
+        opcoes = {
+            "ignorar_acentos": self.var_ignorar_acentos.get(),
+            "tarjar_cpfs": self.var_tarjar_cpfs.get(),
+            "tarjar_emails": self.var_tarjar_emails.get(),
+            "tarjar_telefones": self.var_tarjar_telefones.get(),
+            "cor_tarja": self.var_cor_tarja.get(),
+        }
 
         self.is_processando = True
         self.btn_executar.config(state=tk.DISABLED, bg="#94a3b8")
@@ -596,12 +780,12 @@ PRIVACIDADE & PORTABILIDADE:
 
         thread = threading.Thread(
             target=self._executar_em_background,
-            args=(list(self.arquivos_selecionados), termos),
+            args=(list(self.arquivos_selecionados), termos, opcoes),
             daemon=True
         )
         thread.start()
 
-    def _executar_em_background(self, arquivos: list[str], termos: list[str]):
+    def _executar_em_background(self, arquivos: list[str], termos: list[str], opcoes: dict):
         sucessos = 0
         erros = 0
         self.fila_mensagens.put(("LOG", f"=== Iniciando tarjação de {len(arquivos)} arquivo(s) ===\n"))
@@ -611,7 +795,16 @@ PRIVACIDADE & PORTABILIDADE:
                 def cb(msg):
                     self.fila_mensagens.put(("LOG", msg))
 
-                caminho_saida = tarjar(caminho, termos, callback_log=cb)
+                caminho_saida = tarjar(
+                    caminho,
+                    termos,
+                    ignorar_acentos=opcoes["ignorar_acentos"],
+                    tarjar_cpfs=opcoes["tarjar_cpfs"],
+                    tarjar_emails=opcoes["tarjar_emails"],
+                    tarjar_telefones=opcoes["tarjar_telefones"],
+                    cor_tarja=opcoes["cor_tarja"],
+                    callback_log=cb
+                )
                 sucessos += 1
             except Exception as e:
                 erros += 1
