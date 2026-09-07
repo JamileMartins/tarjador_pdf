@@ -23,7 +23,16 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-VERSAO_APP = "1.3.0"
+# Suporte a Arrastar e Soltar (Drag & Drop) com fallback gracioso
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+    BaseTk = TkinterDnD.Tk
+except Exception:
+    HAS_DND = False
+    BaseTk = tk.Tk
+
+VERSAO_APP = "1.4.0"
 
 # Não há dados pessoais fixados no código-fonte; tudo é lido e salvo no arquivo JSON.
 TERMOS_SENSIVEIS_PADRAO: list[str] = []
@@ -43,6 +52,13 @@ def _safe_print(msg: str):
         print(msg.encode(enc, errors="replace").decode(enc))
 
 
+def obter_caminho_base() -> str:
+    """Retorna o diretório base onde a aplicação ou executável reside."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def criar_regex_tolerante(termo: str) -> re.Pattern:
     """Cria uma expressão regular que ignora acentos, maiúsculas/minúsculas e variações de espaçamento."""
     mapa_acentos = {
@@ -53,7 +69,6 @@ def criar_regex_tolerante(termo: str) -> re.Pattern:
         'u': '[uúùûüUÚÙÛÜ]',
         'c': '[cçCÇ]',
     }
-    # Normaliza primeiro retirando diacríticos
     termo_sem_acento = "".join(
         c for c in unicodedata.normalize("NFD", termo) if unicodedata.category(c) != "Mn"
     )
@@ -71,11 +86,7 @@ def criar_regex_tolerante(termo: str) -> re.Pattern:
 
 def obter_caminho_config() -> str:
     """Retorna o caminho onde a lista de termos é salva de forma persistente."""
-    if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
+    base_dir = obter_caminho_base()
     caminho_local = os.path.join(base_dir, "termos_sensiveis.json")
     teste_escrita = os.path.join(base_dir, ".test_write.tmp")
     try:
@@ -134,6 +145,8 @@ def tarjar(
     tarjar_emails: bool = False,
     tarjar_telefones: bool = False,
     cor_tarja: str = "preto",
+    modo_pasta_saida: str = "mesma",
+    pasta_saida_custom: str = "",
     callback_log=None
 ) -> str:
     """Tarja os termos sensíveis no arquivo PDF informado e salva com sufixo '_tarjado.pdf'."""
@@ -148,7 +161,17 @@ def tarjar(
 
     cor_fill = (0, 0, 0) if cor_tarja.lower() != "branco" else (1, 1, 1)
     nome_arquivo = os.path.basename(caminho_entrada)
-    caminho_saida = caminho_entrada.rsplit(".", 1)[0] + "_tarjado.pdf"
+    nome_saida = nome_arquivo.rsplit(".", 1)[0] + "_tarjado.pdf"
+
+    # Resolução da pasta de destino
+    if modo_pasta_saida == "subpasta":
+        dir_saida = os.path.join(os.path.dirname(caminho_entrada), "tarjados")
+        os.makedirs(dir_saida, exist_ok=True)
+        caminho_saida = os.path.join(dir_saida, nome_saida)
+    elif modo_pasta_saida == "custom" and pasta_saida_custom and os.path.isdir(pasta_saida_custom):
+        caminho_saida = os.path.join(pasta_saida_custom, nome_saida)
+    else:
+        caminho_saida = os.path.join(os.path.dirname(caminho_entrada), nome_saida)
 
     log(f"--- Iniciando: {nome_arquivo} (Tarja: {cor_tarja.capitalize()}) ---")
     doc = pymupdf.open(caminho_entrada)
@@ -194,7 +217,6 @@ def tarjar(
                 except Exception:
                     pass
 
-            # Busca direta (exata ou fallback)
             for a in pagina.search_for(termo):
                 if a not in areas_encontradas:
                     areas_encontradas.append(a)
@@ -203,12 +225,12 @@ def tarjar(
                 pagina.add_redact_annot(area, fill=cor_fill)
                 contagem[termo] += 1
 
-        pagina.apply_redactions()  # remove o texto/objeto do PDF permanentemente
+        pagina.apply_redactions()
 
     doc.save(caminho_saida)
     doc.close()
 
-    log(f"[OK] Salvo como: {os.path.basename(caminho_saida)} ({total_paginas} página(s))")
+    log(f"[OK] Salvo em: {caminho_saida} ({total_paginas} página(s))")
 
     total_encontrados = sum(contagem.values()) + sum(contagem_padroes.values())
     log(f"Ocorrências tarjadas (Total: {total_encontrados}):")
@@ -232,12 +254,15 @@ def tarjar(
 redigir = tarjar
 
 
-class TarjadorPDFApp(tk.Tk):
+class TarjadorPDFApp(BaseTk):
     def __init__(self):
         super().__init__()
         self.title(f"Tarjador de PDFs v{VERSAO_APP} - Remoção de Dados Sensíveis")
-        self.geometry("880x790")
-        self.minsize(740, 640)
+        self.geometry("900x820")
+        self.minsize(760, 660)
+
+        # Aplica o ícone do aplicativo se disponível
+        self._aplicar_icone(self)
 
         # Configuração de estilo ttk
         self.style = ttk.Style(self)
@@ -249,7 +274,7 @@ class TarjadorPDFApp(tk.Tk):
         self.arquivos_selecionados: list[str] = []
         self.is_processando = False
         self.caminho_config = obter_caminho_config()
-        self.ultima_pasta_usada = os.path.dirname(os.path.abspath(__file__))
+        self.ultima_pasta_usada = obter_caminho_base()
         self.fila_mensagens: queue.Queue = queue.Queue()
 
         # Variáveis de opções avançadas
@@ -259,12 +284,63 @@ class TarjadorPDFApp(tk.Tk):
         self.var_tarjar_telefones = tk.BooleanVar(value=False)
         self.var_cor_tarja = tk.StringVar(value="preto")
 
+        # Variáveis de pasta de saída
+        self.var_modo_saida = tk.StringVar(value="mesma")
+        self.var_pasta_custom = tk.StringVar(value="")
+
         self._construir_interface()
         self._agendar_leitura_fila()
         self._carregar_termos_iniciais()
 
+        # Configuração de Drag & Drop se disponível
+        if HAS_DND:
+            self._configurar_drag_and_drop()
+
         # Salva termos automaticamente ao fechar o programa
         self.protocol("WM_DELETE_WINDOW", self._ao_fechar)
+
+    def _aplicar_icone(self, janela: tk.Toplevel | tk.Tk):
+        """Aplica o ícone .ico na janela se o arquivo existir."""
+        caminho_ico = os.path.join(obter_caminho_base(), "app_icon.ico")
+        if os.path.isfile(caminho_ico):
+            try:
+                janela.iconbitmap(caminho_ico)
+            except Exception:
+                pass
+
+    def _configurar_drag_and_drop(self):
+        """Habilita arrastar e soltar PDFs diretamente na janela e na lista."""
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self._ao_soltar_arquivos)
+            self.listbox_arquivos.drop_target_register(DND_FILES)
+            self.listbox_arquivos.dnd_bind('<<Drop>>', self._ao_soltar_arquivos)
+        except Exception as e:
+            _safe_print(f"Aviso ao ativar Drag & Drop: {e}")
+
+    def _ao_soltar_arquivos(self, event):
+        """Trata arquivos ou pastas soltos via Drag & Drop."""
+        if not event.data:
+            return
+        caminhos_brutos = self.tk.splitlist(event.data)
+        novos_adicionados = 0
+        for c in caminhos_brutos:
+            c_norm = os.path.abspath(c)
+            if os.path.isdir(c_norm):
+                for item in os.listdir(c_norm):
+                    if item.lower().endswith(".pdf") and not item.endswith("_tarjado.pdf"):
+                        fpath = os.path.abspath(os.path.join(c_norm, item))
+                        if fpath not in self.arquivos_selecionados:
+                            self.arquivos_selecionados.append(fpath)
+                            novos_adicionados += 1
+            elif os.path.isfile(c_norm) and c_norm.lower().endswith(".pdf"):
+                if c_norm not in self.arquivos_selecionados:
+                    self.arquivos_selecionados.append(c_norm)
+                    novos_adicionados += 1
+
+        if novos_adicionados > 0:
+            self._atualizar_lista_arquivos()
+            self._log_msg(f"Arrastar & Soltar: {novos_adicionados} arquivo(s) PDF adicionado(s).")
 
     def _construir_interface(self):
         container = ttk.Frame(self, padding=14)
@@ -295,9 +371,10 @@ class TarjadorPDFApp(tk.Tk):
         )
         lbl_versao.pack(side=tk.LEFT, padx=(8, 0), pady=(4, 0))
 
+        dnd_status = " • [Arrastar & Soltar Habilitado]" if HAS_DND else ""
         lbl_subtitulo = ttk.Label(
             frame_header_esq,
-            text="Selecione arquivos PDF para tarjar e remover definitivamente dados sensíveis.",
+            text=f"Selecione arquivos PDF para tarjar e remover definitivamente dados sensíveis.{dnd_status}",
             font=("Segoe UI", 9)
         )
         lbl_subtitulo.pack(anchor=tk.W, pady=(2, 0))
@@ -330,16 +407,23 @@ class TarjadorPDFApp(tk.Tk):
         )
         btn_add_pasta.pack(side=tk.LEFT, padx=(0, 6))
 
+        btn_previa = ttk.Button(
+            frame_botoes_arq,
+            text="👁 Pré-visualizar",
+            command=self._abrir_previa
+        )
+        btn_previa.pack(side=tk.LEFT, padx=(0, 6))
+
         btn_remover = ttk.Button(
             frame_botoes_arq,
-            text="Remover Selecionado(s)",
+            text="Remover",
             command=self._remover_selecionados
         )
         btn_remover.pack(side=tk.LEFT, padx=(0, 6))
 
         btn_limpar = ttk.Button(
             frame_botoes_arq,
-            text="Limpar Lista",
+            text="Limpar Tudo",
             command=self._limpar_arquivos
         )
         btn_limpar.pack(side=tk.LEFT)
@@ -361,9 +445,12 @@ class TarjadorPDFApp(tk.Tk):
         self.listbox_arquivos.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Duplo clique no item abre a prévia
+        self.listbox_arquivos.bind("<Double-Button-1>", lambda e: self._abrir_previa())
+
         self.lbl_contagem_arqs = ttk.Label(
             frame_arquivos,
-            text="0 arquivo(s) selecionado(s)",
+            text="0 arquivo(s) selecionado(s) — (Dica: Arraste arquivos para cá ou dê duplo clique para ver prévia)",
             font=("Segoe UI", 9, "italic")
         )
         self.lbl_contagem_arqs.pack(anchor=tk.W, pady=(4, 0))
@@ -410,14 +497,14 @@ class TarjadorPDFApp(tk.Tk):
 
         self.txt_termos = ScrolledText(
             frame_termos,
-            height=5,
+            height=4,
             font=("Consolas", 9),
             wrap=tk.WORD
         )
         self.txt_termos.pack(fill=tk.BOTH, expand=True)
 
-        # Seção 3: Opções Avançadas do Motor de Tarjação
-        frame_opcoes = ttk.LabelFrame(container, text=" 3. Opções Avançadas de Tarjação ", padding=10)
+        # Seção 3: Opções Avançadas e Destino
+        frame_opcoes = ttk.LabelFrame(container, text=" 3. Opções Avançadas e Destino ", padding=10)
         frame_opcoes.pack(fill=tk.X, pady=(0, 8))
 
         # Linha 1: Busca inteligente e detecção automática
@@ -433,14 +520,14 @@ class TarjadorPDFApp(tk.Tk):
 
         chk_cpfs = ttk.Checkbutton(
             frame_chk,
-            text="Auto-tarjar todos os CPFs",
+            text="Auto-tarjar CPFs",
             variable=self.var_tarjar_cpfs
         )
         chk_cpfs.pack(side=tk.LEFT, padx=(0, 14))
 
         chk_emails = ttk.Checkbutton(
             frame_chk,
-            text="Auto-tarjar todos os E-mails",
+            text="Auto-tarjar E-mails",
             variable=self.var_tarjar_emails
         )
         chk_emails.pack(side=tk.LEFT, padx=(0, 14))
@@ -452,28 +539,56 @@ class TarjadorPDFApp(tk.Tk):
         )
         chk_telefones.pack(side=tk.LEFT)
 
-        # Linha 2: Cor da Tarja
-        frame_cor = ttk.Frame(frame_opcoes)
-        frame_cor.pack(fill=tk.X, pady=(6, 0))
+        # Linha 2: Cor da Tarja e Destino dos Arquivos
+        frame_linha2 = ttk.Frame(frame_opcoes)
+        frame_linha2.pack(fill=tk.X, pady=(8, 0))
 
-        lbl_cor = ttk.Label(frame_cor, text="Cor da Tarja:", font=("Segoe UI", 9, "bold"))
-        lbl_cor.pack(side=tk.LEFT, padx=(0, 8))
+        lbl_cor = ttk.Label(frame_linha2, text="Cor da Tarja:", font=("Segoe UI", 9, "bold"))
+        lbl_cor.pack(side=tk.LEFT, padx=(0, 6))
 
         rb_preto = ttk.Radiobutton(
-            frame_cor,
-            text="Preto Sólido (Padrão)",
+            frame_linha2,
+            text="Preto",
             variable=self.var_cor_tarja,
             value="preto"
         )
-        rb_preto.pack(side=tk.LEFT, padx=(0, 12))
+        rb_preto.pack(side=tk.LEFT, padx=(0, 10))
 
         rb_branco = ttk.Radiobutton(
-            frame_cor,
-            text="Branco (Ocultação Limpa / Impressão)",
+            frame_linha2,
+            text="Branco (Limpo)",
             variable=self.var_cor_tarja,
             value="branco"
         )
-        rb_branco.pack(side=tk.LEFT)
+        rb_branco.pack(side=tk.LEFT, padx=(0, 20))
+
+        lbl_dest = ttk.Label(frame_linha2, text="Salvar em:", font=("Segoe UI", 9, "bold"))
+        lbl_dest.pack(side=tk.LEFT, padx=(0, 6))
+
+        rb_dest_mesma = ttk.Radiobutton(
+            frame_linha2,
+            text="Mesma pasta",
+            variable=self.var_modo_saida,
+            value="mesma"
+        )
+        rb_dest_mesma.pack(side=tk.LEFT, padx=(0, 10))
+
+        rb_dest_sub = ttk.Radiobutton(
+            frame_linha2,
+            text="Subpasta 'tarjados/'",
+            variable=self.var_modo_saida,
+            value="subpasta"
+        )
+        rb_dest_sub.pack(side=tk.LEFT, padx=(0, 10))
+
+        rb_dest_cust = ttk.Radiobutton(
+            frame_linha2,
+            text="Pasta personalizada...",
+            variable=self.var_modo_saida,
+            value="custom",
+            command=self._selecionar_pasta_destino
+        )
+        rb_dest_cust.pack(side=tk.LEFT)
 
         # Seção 4: Ação e Progresso
         frame_acao = ttk.Frame(container)
@@ -515,7 +630,7 @@ class TarjadorPDFApp(tk.Tk):
 
         self.txt_log = ScrolledText(
             frame_log,
-            height=7,
+            height=6,
             font=("Consolas", 9),
             state=tk.NORMAL,
             bg="#f8fafc",
@@ -523,16 +638,125 @@ class TarjadorPDFApp(tk.Tk):
         )
         self.txt_log.pack(fill=tk.BOTH, expand=True)
 
+    def _selecionar_pasta_destino(self):
+        """Permite ao usuário selecionar uma pasta fixa de saída."""
+        pasta = filedialog.askdirectory(title="Selecione a pasta de destino para os PDFs tarjados")
+        if pasta:
+            self.var_pasta_custom.set(pasta)
+            self._log_msg(f"Destino personalizado definido: {pasta}")
+        else:
+            if not self.var_pasta_custom.get():
+                self.var_modo_saida.set("mesma")
+
+    def _abrir_previa(self):
+        """Abre uma janela modal com a pré-visualização da primeira página do PDF selecionado."""
+        selecionados = list(self.listbox_arquivos.curselection())
+        if not selecionados:
+            if self.arquivos_selecionados:
+                idx = 0
+            else:
+                messagebox.showinfo("Prévia", "Selecione um arquivo PDF na lista para visualizar a prévia.")
+                return
+        else:
+            idx = selecionados[0]
+
+        caminho_pdf = self.arquivos_selecionados[idx]
+        if not os.path.isfile(caminho_pdf):
+            messagebox.showerror("Erro", f"Arquivo não encontrado: {caminho_pdf}")
+            return
+
+        janela_previa = tk.Toplevel(self)
+        janela_previa.title(f"Pré-visualização: {os.path.basename(caminho_pdf)}")
+        janela_previa.geometry("720x800")
+        janela_previa.minsize(600, 680)
+        self._aplicar_icone(janela_previa)
+        janela_previa.transient(self)
+
+        doc = pymupdf.open(caminho_pdf)
+        num_paginas = len(doc)
+        pagina_atual = [0]  # lista para permitir mutação no escopo interno
+
+        pad = ttk.Frame(janela_previa, padding=10)
+        pad.pack(fill=tk.BOTH, expand=True)
+
+        frame_ctrl = ttk.Frame(pad)
+        frame_ctrl.pack(fill=tk.X, pady=(0, 8))
+
+        lbl_info = ttk.Label(
+            frame_ctrl,
+            text=f"Arquivo: {os.path.basename(caminho_pdf)} ({num_paginas} página(s))",
+            font=("Segoe UI", 9, "bold")
+        )
+        lbl_info.pack(side=tk.LEFT)
+
+        frame_nav = ttk.Frame(frame_ctrl)
+        frame_nav.pack(side=tk.RIGHT)
+
+        lbl_pag = ttk.Label(frame_nav, text="Página 1 de 1", font=("Segoe UI", 9))
+
+        # Canvas com Scrollbar para imagem
+        frame_canvas = ttk.Frame(pad)
+        frame_canvas.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(frame_canvas, bg="#475569")
+        scroll_y = ttk.Scrollbar(frame_canvas, orient=tk.VERTICAL, command=canvas.yview)
+        scroll_x = ttk.Scrollbar(pad, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(xscrollcommand=scroll_x.set, yscrollcommand=scroll_y.set)
+
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_x.pack(fill=tk.X, pady=(4, 0))
+
+        img_ref = [None]
+
+        def renderizar():
+            p = pagina_atual[0]
+            lbl_pag.config(text=f"Página {p + 1} de {num_paginas}")
+            btn_ant.config(state=tk.NORMAL if p > 0 else tk.DISABLED)
+            btn_prox.config(state=tk.NORMAL if p < num_paginas - 1 else tk.DISABLED)
+
+            page = doc[p]
+            pix = page.get_pixmap(dpi=110)
+            photo = tk.PhotoImage(data=pix.tobytes("png"))
+            img_ref[0] = photo
+
+            canvas.delete("all")
+            canvas.create_image(10, 10, anchor=tk.NW, image=photo)
+            canvas.config(scrollregion=(0, 0, pix.width + 20, pix.height + 20))
+
+        def anterior():
+            if pagina_atual[0] > 0:
+                pagina_atual[0] -= 1
+                renderizar()
+
+        def proxima():
+            if pagina_atual[0] < num_paginas - 1:
+                pagina_atual[0] += 1
+                renderizar()
+
+        btn_ant = ttk.Button(frame_nav, text="◄ Anterior", command=anterior)
+        btn_ant.pack(side=tk.LEFT, padx=(0, 6))
+        lbl_pag.pack(side=tk.LEFT, padx=(0, 6))
+        btn_prox = ttk.Button(frame_nav, text="Próxima ►", command=proxima)
+        btn_prox.pack(side=tk.LEFT)
+
+        def ao_fechar_previa():
+            doc.close()
+            janela_previa.destroy()
+
+        janela_previa.protocol("WM_DELETE_WINDOW", ao_fechar_previa)
+        renderizar()
+
     def _abrir_sobre(self):
         """Abre a janela com a seção Sobre, descrição e instruções detalhadas."""
         janela = tk.Toplevel(self)
         janela.title("Sobre o Tarjador de PDFs")
         janela.geometry("660x560")
         janela.minsize(580, 480)
+        self._aplicar_icone(janela)
         janela.transient(self)
         janela.grab_set()
 
-        # Centraliza a janela sobre a principal
         self.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() // 2) - (660 // 2)
         y = self.winfo_y() + (self.winfo_height() // 2) - (560 // 2)
@@ -541,7 +765,6 @@ class TarjadorPDFApp(tk.Tk):
         pad = ttk.Frame(janela, padding=16)
         pad.pack(fill=tk.BOTH, expand=True)
 
-        # Topo
         lbl_topo = ttk.Label(
             pad,
             text="Tarjador de PDFs Confidenciais",
@@ -557,22 +780,23 @@ class TarjadorPDFApp(tk.Tk):
         )
         lbl_ver.pack(anchor=tk.W, pady=(0, 10))
 
-        # Texto informativo com scroll
         txt_info = ScrolledText(pad, wrap=tk.WORD, font=("Segoe UI", 9), height=18)
         txt_info.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
         texto_sobre = f"""O QUE É ESTE PROGRAMA?
-O Tarjador de PDFs realiza a remoção permanente e irreversível de termos sensíveis (nomes, CPFs, endereços, etc.) em documentos PDF.
+O Tarjador de PDFs realiza a remoção permanente e irreversível de dados confidenciais (nomes, CPFs, endereços, etc.) em documentos PDF.
 
 DIFERENÇA PARA FERRAMENTAS VISUAIS COMUNS:
 Muitos editores apenas desenham retângulos pretos sobre o texto. Nesses casos, qualquer pessoa pode selecionar, copiar ou usar ferramentas de OCR para ler o que estava por baixo.
 Este programa utiliza PyMuPDF para expurgar de verdade os caracteres do código interno do documento, tornando impossível recuperar a informação censurada.
 
 --------------------------------------------------
-NOVIDADES DA VERSÃO 1.3.0:
-• Busca Inteligente: Tolera variações de acentuação ('á' = 'a') e maiúsculas/minúsculas.
-• Auto-Detecção por Padrões (Regex): Tarja automaticamente CPFs, E-mails e Telefones detectados no documento.
-• Cor da Tarja Customizável: Escolha entre Preto Sólido ou Branco (ocultação limpa para impressões).
+NOVIDADES DA VERSÃO 1.4.0 (UX & Usabilidade):
+• Arrastar e Soltar (Drag & Drop): Arraste arquivos ou pastas de PDFs diretamente para a janela.
+• Pré-visualização Integrada (Preview): Clique no botão 'Pré-visualizar' ou dê duplo clique em um item da lista para inspecionar as páginas em alta definição.
+• Pastas de Saída Flexíveis: Escolha salvar na mesma pasta, em subpasta 'tarjados/' ou em pasta personalizada.
+• Ícone Profissional (.ico) integrado na aplicação e executável.
+• Motor Inteligente: Busca tolerante a acentos e auto-detecção de CPFs, E-mails e Telefones por Regex.
 
 --------------------------------------------------
 GUIA RÁPIDO PARA NOVOS UTILIZADORES:
@@ -582,22 +806,17 @@ GUIA RÁPIDO PARA NOVOS UTILIZADORES:
    - Clique em 'Salvar no JSON'. Os termos ficam salvos no arquivo 'termos_sensiveis.json' ao lado do programa e nunca são perdidos.
 
 2. SELECIONAR OS DOCUMENTOS (Quadro 1)
-   - Clique em 'Selecionar Arquivo(s)...' para escolher um ou mais PDFs de qualquer pasta.
-   - Ou clique em 'Adicionar Pasta...' para carregar todos os PDFs de um diretório de uma só vez.
+   - Arraste PDFs para a lista, use 'Selecionar Arquivo(s)...' ou 'Adicionar Pasta...'.
+   - Dê duplo clique em qualquer item da lista para inspecionar sua prévia visual.
 
-3. CONFIGURAR OPÇÕES AVANÇADAS (Quadro 3)
+3. CONFIGURAR OPÇÕES E DESTINO (Quadro 3)
    - Ative a busca inteligente e/ou detecção automática de CPFs/E-mails.
-   - Escolha a cor da tarja desejada.
+   - Escolha a cor da tarja e a pasta de saída desejada.
 
 4. INICIAR A TARJAÇÃO
    - Clique no botão verde 'Iniciar Tarjação dos PDFs'.
-   - O processamento roda em segundo plano e a barra indicará o progresso.
-   - O registro (Log) detalhará quantas vezes cada termo foi encontrado e removido.
-
-5. ACESSAR OS RESULTADOS
-   - Para sua total segurança, os arquivos originais NUNCA são sobrescritos.
-   - Cada arquivo gera uma nova cópia com o sufixo '_tarjado.pdf' (ex.: fatura_tarjado.pdf) na mesma pasta original.
-   - Ao concluir, clique em 'Abrir Pasta dos Arquivos' para visualizá-los diretamente no Windows Explorer.
+   - Os arquivos originais NUNCA são alterados; novos arquivos com '_tarjado.pdf' são criados no destino escolhido.
+   - Ao concluir, clique em 'Abrir Pasta dos Arquivos'.
 
 --------------------------------------------------
 PRIVACIDADE & PORTABILIDADE:
@@ -631,7 +850,7 @@ PRIVACIDADE & PORTABILIDADE:
                 break
 
     def _adicionar_arquivos(self):
-        diretorio_inicial = self.ultima_pasta_usada if os.path.exists(self.ultima_pasta_usada) else os.path.dirname(os.path.abspath(__file__))
+        diretorio_inicial = self.ultima_pasta_usada if os.path.exists(self.ultima_pasta_usada) else obter_caminho_base()
         caminhos = filedialog.askopenfilenames(
             title="Selecione os arquivos PDF",
             initialdir=diretorio_inicial,
@@ -646,7 +865,7 @@ PRIVACIDADE & PORTABILIDADE:
             self._atualizar_lista_arquivos()
 
     def _adicionar_pasta(self):
-        diretorio_inicial = self.ultima_pasta_usada if os.path.exists(self.ultima_pasta_usada) else os.path.dirname(os.path.abspath(__file__))
+        diretorio_inicial = self.ultima_pasta_usada if os.path.exists(self.ultima_pasta_usada) else obter_caminho_base()
         pasta = filedialog.askdirectory(
             title="Selecione a pasta com os PDFs",
             initialdir=diretorio_inicial
@@ -680,7 +899,8 @@ PRIVACIDADE & PORTABILIDADE:
             pasta = os.path.dirname(c)
             self.listbox_arquivos.insert(tk.END, f"{nome}  -  ({pasta})")
         qtd = len(self.arquivos_selecionados)
-        self.lbl_contagem_arqs.config(text=f"{qtd} arquivo(s) selecionado(s)")
+        dnd_hint = " • (Arraste arquivos ou dê duplo clique para ver prévia)" if HAS_DND else " • (Duplo clique para ver prévia)"
+        self.lbl_contagem_arqs.config(text=f"{qtd} arquivo(s) selecionado(s){dnd_hint}")
 
     def _carregar_termos_iniciais(self):
         termos = carregar_termos_config()
@@ -729,12 +949,22 @@ PRIVACIDADE & PORTABILIDADE:
 
     def _abrir_pasta_arquivos(self):
         pasta = self.ultima_pasta_usada
-        if self.arquivos_selecionados:
+        modo = self.var_modo_saida.get()
+        if modo == "custom" and self.var_pasta_custom.get() and os.path.exists(self.var_pasta_custom.get()):
+            pasta = self.var_pasta_custom.get()
+        elif modo == "subpasta" and self.arquivos_selecionados:
+            sub = os.path.join(os.path.dirname(self.arquivos_selecionados[0]), "tarjados")
+            if os.path.exists(sub):
+                pasta = sub
+            else:
+                pasta = os.path.dirname(self.arquivos_selecionados[0])
+        elif self.arquivos_selecionados:
             pasta = os.path.dirname(self.arquivos_selecionados[0])
+
         if os.path.exists(pasta):
             os.startfile(pasta)
         else:
-            messagebox.showinfo("Aviso", f"A pasta não existe mais: {pasta}")
+            messagebox.showinfo("Aviso", f"A pasta não existe: {pasta}")
 
     def _iniciar_processamento(self):
         if self.is_processando:
@@ -758,17 +988,17 @@ PRIVACIDADE & PORTABILIDADE:
             )
             return
 
-        # Salva os termos automaticamente se houver termos digitados
         if termos:
             salvar_termos_config(termos)
 
-        # Captura opções
         opcoes = {
             "ignorar_acentos": self.var_ignorar_acentos.get(),
             "tarjar_cpfs": self.var_tarjar_cpfs.get(),
             "tarjar_emails": self.var_tarjar_emails.get(),
             "tarjar_telefones": self.var_tarjar_telefones.get(),
             "cor_tarja": self.var_cor_tarja.get(),
+            "modo_pasta_saida": self.var_modo_saida.get(),
+            "pasta_saida_custom": self.var_pasta_custom.get(),
         }
 
         self.is_processando = True
@@ -803,6 +1033,8 @@ PRIVACIDADE & PORTABILIDADE:
                     tarjar_emails=opcoes["tarjar_emails"],
                     tarjar_telefones=opcoes["tarjar_telefones"],
                     cor_tarja=opcoes["cor_tarja"],
+                    modo_pasta_saida=opcoes["modo_pasta_saida"],
+                    pasta_saida_custom=opcoes["pasta_saida_custom"],
                     callback_log=cb
                 )
                 sucessos += 1
@@ -839,7 +1071,6 @@ RedatorPDFApp = TarjadorPDFApp
 
 
 def main():
-    # Se receber arquivos via argumentos na linha de comando, executa em modo CLI
     if len(sys.argv) > 1:
         arquivos = [arg for arg in sys.argv[1:] if arg.lower().endswith(".pdf")]
         if not arquivos:
