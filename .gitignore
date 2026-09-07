@@ -1,0 +1,48 @@
+# =======================================================
+# IMPORTANTE: PROTEÇÃO DE DADOS PESSOAIS E DOCUMENTOS
+# =======================================================
+
+# Arquivo com os dados sensíveis reais (NUNCA ENVIAR AO GITHUB)
+termos_sensiveis.json
+*.json
+!termos_sensiveis.example.json
+
+# Todos os documentos PDF (faturas pessoais e PDFs tarjados)
+*.pdf
+
+# Arquivos de backup
+*.bak
+
+# =======================================================
+# AMBIENTE VIRTUAL E DEPENDÊNCIAS
+# =======================================================
+.venv/
+venv/
+ENV/
+env/
+
+# =======================================================
+# COMPILAÇÃO DO PYINSTALLER E EXECUTÁVEIS
+# =======================================================
+build/
+dist/
+*.exe
+*.spec
+
+# =======================================================
+# ARQUIVOS TEMPORÁRIOS E LOGS
+# =======================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.tmp
+.test_write.tmp
+
+# =======================================================
+# CONFIGURAÇÕES DE IDES E SISTEMA
+# =======================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
